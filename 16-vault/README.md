@@ -1,4 +1,4 @@
-# HashiCorp Vault — Secret Management
+# HashiCorp Vault + External Secrets Operator (ESO) — Secret Management
 
 Bank locker for secrets — passwords, API keys, DB credentials, certificates.
 
@@ -22,288 +22,290 @@ Bank locker for secrets — passwords, API keys, DB credentials, certificates.
 - **Storage Backend** — where Vault's own data (encrypted) is stored (Raft integrated storage, Consul, S3, File — File/Raft-single-node is dev/learning only, never prod)
 - **Auth Methods** — how clients authenticate (Token, Userpass, AppRole, Kubernetes, JWT/OIDC, AWS IAM)
 - **Secret Engines** — where secrets live (KV store, Database, AWS, PKI)
-- **Seal/Unseal Mechanism** — Vault storage is always encrypted at rest. Vault starts **sealed** — it cannot read its own storage until it has the encryption key. This is the part `vault server -dev` hides from you (dev mode auto-unseals with a throwaway key).
+- **Seal/Unseal Mechanism** — Vault storage is always encrypted at rest. Vault starts **sealed** — it cannot read its own storage until it has the encryption key. `vault server -dev` hides this by auto-unsealing with a throwaway key.
+
+**How this project's flow will actually look (K8s + ESO, not Agent Injector):**
 
 ```
-App starts
- -> Authenticate with Vault (AppRole/K8s auth)
- -> Get Token
- -> Request secret: vault kv get secret/devhub/db
- -> Vault returns: {username, password}
- -> App uses secret (never stored in code!)
+Vault (secret store)
+   ↓
+ClusterSecretStore   → Vault ka connection + auth config
+   ↓
+ExternalSecret        → kaunsa Vault path se kaunsa secret chahiye
+   ↓
+ESO controller auto-creates a normal Kubernetes Secret
+   ↓
+Deployment references that K8s Secret (normal secretKeyRef syntax — nothing new here)
 ```
+
+> Note: Agent Injector (sidecar/init-container that injects secrets as files) is a *different* Vault-K8s integration pattern. We are using **ESO**, which produces a normal K8s `Secret` object instead — simpler, and app code / Deployment YAML stays exactly like what you already know.
 
 ---
 
-## 3. Install Vault (Ubuntu)
+## 3. Install & Run Vault (Dev Mode — learning only)
 
 ```bash
 wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
 echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
 sudo apt update && sudo apt install vault -y
-
 vault -version
 ```
 
-### 3a. Dev Mode (learning / local testing ONLY)
+Run dev server (listen on all interfaces — k3s needs to reach it, not just localhost):
 
 ```bash
-vault server -dev
+vault server -dev -dev-listen-address="0.0.0.0:8200"
+```
 
-export VAULT_ADDR='http://127.0.0.1:8200'
-export VAULT_TOKEN='<root-token-printed-in-terminal>'
+In a **new terminal**:
+
+```bash
+export VAULT_ADDR='http://<EC2-private-ip-or-localhost>:8200'
+export VAULT_TOKEN='<root-token-printed-when-server-started>'
 vault status
 ```
 
-⚠️ Dev mode: in-memory storage (data lost on restart), auto-unsealed, root token handed to you directly, TLS disabled. **Never use this for anything real** — it exists only so you can practice commands.
-
-### 3b. Production Mode (real setup — this is what was missing)
-
-Config file `/etc/vault.d/vault.hcl`:
-
-```hcl
-storage "raft" {
-  path    = "/opt/vault/data"
-  node_id = "vault-node-1"
-}
-
-listener "tcp" {
-  address       = "0.0.0.0:8200"
-  tls_cert_file = "/etc/vault.d/tls/vault-cert.pem"
-  tls_key_file  = "/etc/vault.d/tls/vault-key.pem"
-  # tls_disable = "true"   # only for isolated internal testing, never real prod
-}
-
-api_addr     = "https://<vault-node-ip>:8200"
-cluster_addr = "https://<vault-node-ip>:8201"
-ui           = true
-```
-
-Run as a systemd service (Vault's Debian/Ubuntu package already ships a unit file):
-
-```bash
-sudo mkdir -p /opt/vault/data
-sudo chown vault:vault /opt/vault/data
-
-sudo systemctl enable vault
-sudo systemctl start vault
-sudo systemctl status vault
-```
-
-```bash
-export VAULT_ADDR='https://<vault-node-ip>:8200'
-vault status
-# Output will show: Sealed = true   <-- this is expected right after fresh install
-```
-
-### 3c. Initialize Vault (one-time, only once per fresh cluster)
-
-```bash
-vault operator init
-```
-
-This returns:
-- **5 Unseal Keys** (Shamir's Secret Sharing — by default any 3 of these 5 are needed to unseal)
-- **1 Initial Root Token**
-
-⚠️ Save these somewhere safe **outside** Vault itself (password manager, printed & locked, or split among team members). If lost, Vault data is permanently unrecoverable.
-
-### 3d. Unseal Vault (needed every time Vault restarts)
-
-```bash
-vault operator unseal <unseal-key-1>
-vault operator unseal <unseal-key-2>
-vault operator unseal <unseal-key-3>
-# default threshold = 3 out of 5 keys
-
-vault status
-# Sealed = false   <-- now Vault is usable
-```
-
-```bash
-vault login <initial-root-token>
-```
-
-**Interview point:** Root token ko day-to-day use nahi karte — login ke baad turant ek admin/CI policy-based token ya AppRole banao, aur root token ko revoke/secure storage me daal do.
+⚠️ Dev mode: in-memory storage (data lost on restart), auto-unsealed, root token handed to you directly, TLS disabled. **Never use for anything real** — exists only to practice commands. Production setup (Raft storage, TLS, manual unseal with Shamir keys) is a separate hardening exercise — see Section 9.
 
 ---
 
-## 4. Basic Commands — KV Secret Engine (CLI)
+## 4. KV Secret Engine — Store the Notes App Secrets
 
 ```bash
 vault secrets enable -path=secret kv-v2
 
-vault kv put secret/devhub/database \
-  username='root' password='SuperSecurePass123!' host='db.devhub.com'
+vault kv put secret/notes-app/db \
+  username='notesuser' \
+  password='SuperSecret123!' \
+  api_key='dummy-api-key-123'
 
-vault kv get secret/devhub/database
-vault kv get -field=password secret/devhub/database
-vault kv get -format=json secret/devhub/database
+vault kv get secret/notes-app/db
+vault kv get -field=password secret/notes-app/db
+```
 
-vault kv list secret/devhub/
-vault kv delete secret/devhub/database
+Other useful commands:
 
-# KV v2 keeps version history
-vault kv get -version=1 secret/devhub/database
-vault kv undelete -versions=1 secret/devhub/database
+```bash
+vault kv list secret/notes-app/
+vault kv get -version=1 secret/notes-app/db   # KV v2 keeps version history
+vault kv delete secret/notes-app/db
+vault kv undelete -versions=1 secret/notes-app/db
 ```
 
 ---
 
-## 5. Using the Vault UI
-
-CLI ke saath UI bhi available hai (`ui = true` config me set hai) — GUI se secrets/policies dekhna aur manage karna easier lagta hai especially jab team ke saath kaam ho.
-
-**Steps:**
-
-1. Browser me kholo: `https://<vault-node-ip>:8200/ui`
-2. Login screen pe **Method** dropdown se "Token" select karo, root token (ya apna assigned token) paste karo → **Sign In**
-3. Left sidebar → **Secrets Engines** — yahan se dekh sakte ho konse engines enabled hain (KV, AWS, Database, etc.) aur naya engine **Enable new engine** button se add kar sakte ho
-4. Kisi engine (e.g. `secret/`) pe click karo → **Create secret** button se naya KV path aur key-value pairs UI form se add kar sakte ho (CLI ka `vault kv put` jo karta hai wahi)
-5. Left sidebar → **Access → Auth Methods** — yahan Kubernetes/AppRole/JWT auth methods enable + configure kar sakte ho form-based UI se, bina CLI ke
-6. Left sidebar → **Policies → ACL Policies** — naya policy **Create ACL policy** se, HCL text box me policy likh ke save kar sakte ho
-7. Top-right → **Copy token** icon se apna current session token copy kar sakte ho scripts me use karne ke liye
-
-UI aur CLI dono same backend API (`/v1/...`) ko hit karte hain — koi functional difference nahi, sirf convenience ka farak hai. Production automation (Jenkins/CI) hamesha CLI/API se hi hoga; UI mostly manual inspection/debugging ke liye useful hai.
-
----
-
-## 6. Vault Policies (RBAC for secrets)
-
-```hcl
-# devhub-policy.hcl
-path "secret/data/devhub/*" {
-  capabilities = ["read", "list"]
-}
-path "secret/data/devhub/admin/*" {
-  capabilities = ["create", "update", "delete", "read"]
-}
-```
-
-```bash
-vault policy write devhub-policy devhub-policy.hcl
-vault policy list
-vault policy read devhub-policy
-```
-
-Note: KV v2 paths internally prefix with `data/` — CLI `vault kv put secret/devhub/database` maps to actual API path `secret/data/devhub/database`, isliye policies me `secret/data/...` likhna padta hai.
-
----
-
-## 7. Auth Methods
-
-### 7a. Userpass (simple, good for UI demo/testing)
-
-```bash
-vault auth enable userpass
-
-vault write auth/userpass/users/kartavya \
-  password="ChangeMe123!" \
-  policies="devhub-policy"
-
-vault login -method=userpass username=kartavya password="ChangeMe123!"
-```
-
-### 7b. AppRole (machine-to-machine, e.g. CI/CD pipelines)
-
-```bash
-vault auth enable approle
-
-vault write auth/approle/role/jenkins-role \
-  token_policies="devhub-policy" \
-  token_ttl=1h \
-  token_max_ttl=4h
-
-vault read auth/approle/role/jenkins-role/role-id
-vault write -f auth/approle/role/jenkins-role/secret-id
-
-vault write auth/approle/login \
-  role_id="<role-id>" \
-  secret_id="<secret-id>"
-```
-
-### 7c. Kubernetes Auth (for Agent Injector — see section 8)
+## 5. Kubernetes Auth Method — Let k3s Authenticate to Vault
 
 ```bash
 vault auth enable kubernetes
-
-vault write auth/kubernetes/config \
-  kubernetes_host="https://<K8S_API_SERVER>:443"
 ```
+
+Vault needs to verify tokens against your k3s API server. Pull the required values **from your k3s cluster**:
+
+```bash
+# ServiceAccount that Vault will use to validate other tokens (token reviewer)
+kubectl create serviceaccount vault-auth -n default
+
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-auth-token
+  namespace: default
+  annotations:
+    kubernetes.io/service-account.name: vault-auth
+type: kubernetes.io/service-account-token
+EOF
+
+SA_JWT_TOKEN=$(kubectl get secret vault-auth-token -n default -o jsonpath="{.data.token}" | base64 --decode)
+K8S_HOST=$(kubectl config view --raw --minify --flatten -o jsonpath="{.clusters[0].cluster.server}")
+K8S_CA_CERT=$(kubectl config view --raw --minify --flatten -o jsonpath="{.clusters[0].cluster.certificate-authority-data}" | base64 --decode)
+```
+
+```bash
+vault write auth/kubernetes/config \
+  kubernetes_host="$K8S_HOST" \
+  kubernetes_ca_cert="$K8S_CA_CERT" \
+  token_reviewer_jwt="$SA_JWT_TOKEN"
+```
+
+> **k3s 1.24+ note:** ServiceAccount tokens no longer auto-generate a Secret by default — that's why we manually created `vault-auth-token` above with the annotation. If this step errors out, check `kubectl get secret vault-auth-token -n default -o yaml` first before debugging further.
 
 ---
 
-## 8. Vault + Kubernetes (Agent Injector)
-
-Secrets auto-inject as files into pods — no application code change.
-
-**Setup (Helm — official HashiCorp chart):**
+## 6. Policy + Role — Least-Privilege Access for the Notes App
 
 ```bash
-helm repo add hashicorp https://helm.releases.hashicorp.com
-helm repo update
-
-helm install vault-agent-injector hashicorp/vault \
-  --set "injector.enabled=true" \
-  --set "server.enabled=false" \
-  -n vault --create-namespace
-```
-(`server.enabled=false` because Vault itself is already running externally on EC2 in our setup — we only need the injector webhook here.)
-
-**Policy + Role (per service, least privilege):**
-
-```bash
-vault policy write auth-service-policy - <<EOF
-path "secret/data/ecommerce/auth-service" {
+vault policy write notes-app-policy - <<EOF
+path "secret/data/notes-app/*" {
   capabilities = ["read"]
 }
 EOF
+```
 
-vault write auth/kubernetes/role/auth-service \
-  bound_service_account_names=auth-service-sa \
-  bound_service_account_namespaces=ecommerce \
-  policies=auth-service-policy \
+```bash
+vault write auth/kubernetes/role/notes-app-role \
+  bound_service_account_names=notes-app-sa \
+  bound_service_account_namespaces=default \
+  policies=notes-app-policy \
   ttl=1h
 ```
 
-**Deployment annotations:**
+> Note: KV v2 paths internally prefix with `data/` — `vault kv put secret/notes-app/db` maps to actual API path `secret/data/notes-app/db`, hence the policy path above says `secret/data/notes-app/*`.
+
+`notes-app-sa` is the ServiceAccount that will be bound to the Notes app's Deployment (created in Step 8).
+
+---
+
+## 7. Install External Secrets Operator (Helm)
+
+```bash
+helm repo add external-secrets https://charts.external-secrets.io
+helm repo update
+
+helm install external-secrets external-secrets/external-secrets \
+  -n external-secrets --create-namespace
+
+kubectl get pods -n external-secrets   # all pods should be Running
+```
+
+---
+
+## 8. ServiceAccount for the Notes App
 
 ```yaml
+# notes-app-sa.yaml
+apiVersion: v1
+kind: ServiceAccount
 metadata:
-  annotations:
-    vault.hashicorp.com/agent-inject: 'true'
-    vault.hashicorp.com/role: 'auth-service'
-    vault.hashicorp.com/agent-inject-secret-db: 'secret/data/ecommerce/auth-service'
-# injected at: /vault/secrets/db
+  name: notes-app-sa
+  namespace: default
+```
+
+```bash
+kubectl apply -f notes-app-sa.yaml
 ```
 
 ---
 
-## 9. Vault + Spring Boot
-
-```xml
-<dependency>
-  <groupId>org.springframework.cloud</groupId>
-  <artifactId>spring-cloud-starter-vault-config</artifactId>
-</dependency>
-```
+## 9. ClusterSecretStore — Vault Connection Config
 
 ```yaml
-spring:
-  cloud:
+# cluster-secret-store.yaml
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  name: vault-backend
+spec:
+  provider:
     vault:
-      host: <vault-node-ip>
-      port: 8200
-      scheme: https
-      token: ${VAULT_TOKEN}
-      kv:
-        enabled: true
-        default-context: devhub
+      server: "http://<vault-ip>:8200"
+      path: "secret"
+      version: "v2"
+      auth:
+        kubernetes:
+          mountPath: "kubernetes"
+          role: "notes-app-role"
+          serviceAccountRef:
+            name: "notes-app-sa"
+            namespace: "default"
+```
+
+```bash
+kubectl apply -f cluster-secret-store.yaml
+kubectl get clustersecretstore vault-backend
+# STATUS column should show: Valid
 ```
 
 ---
 
-## 10. Vault vs K8s Secrets vs .env
+## 10. ExternalSecret — What to Fetch, Where to Put It
+
+```yaml
+# external-secret.yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: notes-app-external-secret
+  namespace: default
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-backend
+    kind: ClusterSecretStore
+  target:
+    name: notes-app-db-secret     # <- this K8s Secret gets auto-created
+  data:
+    - secretKey: username
+      remoteRef:
+        key: notes-app/db
+        property: username
+    - secretKey: password
+      remoteRef:
+        key: notes-app/db
+        property: password
+    - secretKey: api_key
+      remoteRef:
+        key: notes-app/db
+        property: api_key
+```
+
+```bash
+kubectl apply -f external-secret.yaml
+kubectl get externalsecret          # STATUS: SecretSynced
+kubectl get secret notes-app-db-secret -o yaml   # verify it exists with the right keys
+```
+
+---
+
+## 11. Deployment — Reference the Auto-Created Secret
+
+Nothing new in syntax here — this is the same `secretKeyRef` pattern already used across DevHub 2.0 / QuickCart / Terra & Oak.
+
+```yaml
+spec:
+  template:
+    spec:
+      serviceAccountName: notes-app-sa   # <-- required, or ESO auth fails
+      containers:
+        - name: notes-app
+          env:
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: notes-app-db-secret   # must match target.name from Step 10
+                  key: username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: notes-app-db-secret
+                  key: password
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: notes-app-db-secret
+                  key: api_key
+```
+
+**Known trap (matches the Secret-naming-mismatch bug already hit once before):** `Deployment.secretKeyRef.name` must exactly equal `ExternalSecret.spec.target.name` from Step 10 — not the Vault path, not the ExternalSecret's own `metadata.name`. If pods start with empty env vars, this mismatch is the first thing to check.
+
+---
+
+## 12. Verification Checklist (run in this order when debugging)
+
+```bash
+vault status                                   # Sealed = false?
+vault kv get secret/notes-app/db               # secret actually in Vault?
+kubectl get clustersecretstore vault-backend   # Valid?
+kubectl get externalsecret                     # SecretSynced?
+kubectl get secret notes-app-db-secret -o yaml # keys present & correct?
+kubectl describe pod <notes-app-pod>           # env vars populated? auth errors in events?
+kubectl logs -n external-secrets deploy/external-secrets   # ESO controller logs — auth/permission errors show here
+```
+
+---
+
+## 13. Vault vs K8s Secrets vs .env
 
 | Feature | .env | K8s Secrets | Vault |
 |---|---|---|---|
@@ -317,111 +319,14 @@ spring:
 
 ---
 
-## 11. Production Setup — GitHub Actions OIDC → Vault → AWS
-
-Full flow: GitHub Actions authenticates to Vault via OIDC (no stored secrets), gets **temporary** AWS credentials, runs Terraform.
-
-```
-GitHub Actions -> Vault (EC2) -> AWS (temporary credentials)
-   Push code      JWT verify     IAM User (TTL)
-```
-
-### AWS Secret Engine
-
-```bash
-vault secrets enable aws
-vault write aws/config/root \
-  access_key='AKIA...' secret_key='SECRET...' region='us-east-1'
-
-vault write aws/roles/terraform-role \
-  credential_type=iam_user \
-  policy_document=-<<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]
-}
-EOF
-```
-
-### GitHub OIDC (JWT) Trust
-
-```bash
-vault auth enable jwt
-
-vault write auth/jwt/config \
-  oidc_discovery_url='https://token.actions.githubusercontent.com' \
-  bound_issuer='https://token.actions.githubusercontent.com'
-
-vault policy write terraform-policy -<<EOF
-path "aws/creds/terraform-role" {
-  capabilities = ["read"]
-}
-EOF
-
-vault write auth/jwt/role/gh-actions-role -<<EOF
-{
-  "role_type": "jwt",
-  "bound_audiences": ["https://github.com/kartavynirwel-code"],
-  "user_claim": "sub",
-  "bound_claims_type": "glob",
-  "bound_claims": {"sub": "repo:kartavynirwel-code/DevHub:*"},
-  "token_policies": ["terraform-policy"],
-  "token_ttl": "1h"
-}
-EOF
-```
-
-### GitHub Actions Workflow
-
-```yaml
-name: Terraform Deployment
-on: [push]
-permissions:
-  id-token: write   # required for OIDC
-  contents: read
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./terraform
-    steps:
-      - uses: actions/checkout@v4
-      - name: Fetch Keys from Vault
-        uses: hashicorp/vault-action@v3
-        with:
-          url: https://<vault-ec2-ip>:8200
-          role: gh-actions-role
-          method: jwt
-          secrets: |
-            aws/creds/terraform-role access_key | AWS_ACCESS_KEY_ID ;
-            aws/creds/terraform-role secret_key | AWS_SECRET_ACCESS_KEY
-      - uses: hashicorp/setup-terraform@v3
-      - run: terraform init
-      - run: terraform plan
-      - run: terraform apply -auto-approve
-```
-
-| Step | What happens |
-|---|---|
-| 1. Push | GitHub Actions workflow triggers |
-| 2. OIDC Token | GitHub generates JWT for the repo |
-| 3. Vault Auth | Actions authenticates using JWT |
-| 4. Policy Check | Vault verifies repo bound to role |
-| 5. AWS Creds | Vault creates temp IAM user w/ S3 access |
-| 6. Terraform | Actions uses temp creds to run Terraform |
-| 7. Expiry | Credentials expire after 1h automatically |
-
----
-
-## 12. Production Hardening Checklist
+## 14. Production Hardening Checklist (for later — not needed for dev-mode project)
 
 - [ ] TLS enabled on listener (never `tls_disable = "true"` in real prod)
 - [ ] Raft (integrated storage) or Consul as storage backend — not File
 - [ ] Unseal keys distributed among multiple trusted people (Shamir's Secret Sharing) — no single person holds all keys
 - [ ] Root token revoked after initial admin setup (`vault token revoke <root-token>`); day-to-day access via policy-scoped tokens/AppRole
 - [ ] Audit logging enabled: `vault audit enable file file_path=/var/log/vault_audit.log`
-- [ ] Auto-unseal configured for real clusters (AWS KMS / cloud KMS) so a human isn't manually unsealing after every restart
+- [ ] Auto-unseal configured for real clusters (AWS/cloud KMS) so a human isn't manually unsealing after every restart
 - [ ] Least-privilege policies per service/team — never blanket `path "secret/*" { capabilities = ["read","list","create","update","delete"] }`
 
 ---
@@ -434,17 +339,17 @@ Secret management tool — securely stores and controls access to passwords, API
 **Q: Why Vault over Kubernetes Secrets?**
 K8s Secrets base64-encoded hain — encrypted nahi by default. Vault encryption at rest, fine-grained policies, full audit trail, aur dynamic secret generation deta hai. Production-grade.
 
+**Q: What is External Secrets Operator (ESO), and why use it over Agent Injector?**
+ESO ek K8s controller hai jo external secret managers (Vault, AWS Secrets Manager, etc.) se secrets fetch karke native K8s `Secret` objects bana deta hai. Agent Injector secrets ko file ke form me pod ke andar inject karta hai (sidecar pattern), jisse app code ko file-read logic chahiye hota hai. ESO se app code me zero change hota hai — Deployment same purana `secretKeyRef` pattern use karta hai, sirf Secret ka source ab Vault ban jata hai.
+
+**Q: What is seal/unseal in Vault, and why does it matter?**
+Vault apna storage hamesha encrypted rakhta hai; fresh start ya restart ke baad Vault "sealed" state me hota hai aur data read nahi kar sakta jab tak use decryption key na mile. `vault operator init` root key ko Shamir's Secret Sharing se multiple unseal keys me split kar deta hai (default 5 keys, threshold 3) — koi single person ke paas poora access nahi hota. Production me ye manual process auto-unseal (cloud KMS) se automate kiya jaata hai.
+
+**Q: How does ESO authenticate to Vault in Kubernetes?**
+Kubernetes auth method ke through — ESO ek ServiceAccount token use karta hai (`ClusterSecretStore` me `serviceAccountRef` specify hota hai), Vault us token ko apne configured Kubernetes API server ke against verify karta hai (`token_reviewer_jwt` setup), aur agar role/policy match kare to short-lived Vault token issue hota hai.
+
 **Q: What are dynamic secrets?**
 Vault on-demand credentials generate karta hai with a TTL. Jaise ek temporary DB user create hota hai jo 1 hour baad expire ho jaata hai — no long-lived credentials.
 
-**Q: What is seal/unseal in Vault, and why does it matter?**
-Vault apna storage hamesha encrypted rakhta hai; fresh start ya restart ke baad Vault "sealed" state me hota hai aur data read nahi kar sakta jab tak use decryption key na mile. `vault operator init` root key ko Shamir's Secret Sharing se multiple unseal keys me split kar deta hai (default 5 keys, threshold 3) — koi single person ke paas poora access nahi hota. `vault operator unseal` se threshold number of keys submit karke Vault ko usable banaya jaata hai. Production me ye manual process auto-unseal (cloud KMS) se automate kiya jaata hai.
-
 **Q: What is AppRole auth method?**
-Machine-to-machine authentication — CI/CD pipeline ko Role ID + Secret ID milta hai Vault se authenticate karne ke liye.
-
-**Q: How would you integrate Vault with Kubernetes?**
-Vault Agent Injector — pod annotations add karke, Vault automatically secrets ko file ke roop me inject karta hai pod me. No app code change needed. Injector Helm chart se install hota hai, aur Kubernetes Auth method (ServiceAccount token based) se Pod Vault ko authenticate karta hai.
-
-**Q: Why Vault over static GitHub Secrets for AWS credentials?**
-GitHub Secrets static hote hain — same key forever. Vault TTL-based dynamic credentials deta hai jo automatically expire ho jaate hain — leak hone par bhi useless after expiry.
+Machine-to-machine authentication — CI/CD pipeline ko Role ID + Secret ID milta hai Vault se authenticate karne ke liye. (Alternative to Kubernetes auth — useful for Jenkins running outside the cluster.)
