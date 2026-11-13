@@ -468,6 +468,37 @@ Verify:
 ```bash
 sonar-scanner --version
 ```
+---
+
+## 22. Syft (SBOM Generator)
+
+Software components aur dependencies ki inventory (SBOM) generate karne ke liye.
+
+```bash
+curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
+```
+
+Verify:
+```bash
+syft version
+```
+
+Generate SBOM:
+```bash
+syft nginx:latest -o cyclonedx-json > sbom.json
+```
+
+View SBOM:
+```bash
+jq '.components[] | {name, version, type}' sbom.json
+```
+
+**Remember:**
+- Syft → SBOM Generator
+- Trivy → Vulnerability Scanner
+- CycloneDX → SBOM Format
+
+**Use:** Generate SBOM for every new production image and store it with the corresponding image tag/digest.
 
 ---
 
